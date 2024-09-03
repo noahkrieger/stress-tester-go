@@ -10,28 +10,44 @@ import (
 	"html"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/crypto/ssh"
 )
 
-var totalRunRequests = prometheus.NewCounter(
+var hostname = os.Getenv("HOSTNAME")
+
+var totalRunRequests = prometheus.NewCounterVec(
 	prometheus.CounterOpts{
 		Name:      "http_requests_total",
 		Help:      "The total number of run HTTP requests.",
 		Namespace: "load_test",
 		Subsystem: "stress_tester_go",
 	},
+	[]string{"function", "code"},
 )
 
-var runDuration = prometheus.NewGauge(
+var runDuration = prometheus.NewGaugeVec(
 	prometheus.GaugeOpts{
 		Name:      "run_duration_seconds",
 		Help:      "The duration of the run.",
 		Namespace: "load_test",
 		Subsystem: "stress_tester_go",
 	},
+	[]string{"function", "code"},
+)
+
+var httpThreadDepth = prometheus.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Name:      "http_thread_depth",
+		Help:      "The number of active http threads",
+		Namespace: "load_test",
+		Subsystem: "stress_tester_go",
+	},
+	[]string{"function", "pod"},
 )
 
 func factorial(n uint64) uint64 {
@@ -76,10 +92,12 @@ func keygen(iterations int) error {
 }
 
 func run(w http.ResponseWriter, req *http.Request) {
-	totalRunRequests.Inc()
-	start := time.Now()
-	query := req.URL.Query()
+	httpThreadDepth.With(prometheus.Labels{"function": "run", "pod": hostname}).Inc()
+	defer httpThreadDepth.With(prometheus.Labels{"function": "run", "pod": hostname}).Dec()
 
+	start := time.Now()
+
+	query := req.URL.Query()
 	iterations := 1
 	if query.Has("iterations") {
 		i, err := strconv.Atoi(query.Get("iterations"))
@@ -90,34 +108,45 @@ func run(w http.ResponseWriter, req *http.Request) {
 		iterations = i
 	}
 
-	switch function := query.Get("function"); function {
+	var function string
+	status := http.StatusOK
+
+	switch function = query.Get("function"); function {
 	case "euler":
 		euler(iterations)
 	case "keygen":
 		err := keygen(iterations)
 		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
+			status = http.StatusBadRequest
+			w.WriteHeader(status)
 			_, _ = fmt.Fprintf(w, "Error: error in key generation: %v", err)
 		}
 	case "":
-		w.WriteHeader(http.StatusBadRequest)
+		status = http.StatusBadRequest
+		w.WriteHeader(status)
 		_, _ = fmt.Fprintf(w, "Error: missing function parameter in query string")
 	default:
-		w.WriteHeader(http.StatusBadRequest)
+		status = http.StatusBadRequest
+		w.WriteHeader(status)
 		_, _ = fmt.Fprintf(w, "Error: unknown function '%s'\n", html.EscapeString(function))
 	}
 
 	duration := time.Since(start).Seconds()
 	_, _ = fmt.Fprintf(w, "\nElapsed Time: %f", duration)
-	runDuration.Set(duration)
+	runDuration.WithLabelValues(function, strconv.Itoa(status)).Set(duration)
+	totalRunRequests.WithLabelValues(function, strconv.Itoa(status)).Inc()
 
 }
 
 func main() {
 	prometheus.MustRegister(totalRunRequests)
 	prometheus.MustRegister(runDuration)
+	prometheus.MustRegister(httpThreadDepth)
 	prometheus.MustRegister(collectors.NewBuildInfoCollector())
-
+	for _, e := range os.Environ() {
+		pair := strings.SplitN(e, "=", 2)
+		fmt.Println(pair[0])
+	}
 	http.HandleFunc("/run", run)
 	http.Handle("/metrics", promhttp.Handler())
 	log.Fatal(http.ListenAndServe(":8090", nil))
